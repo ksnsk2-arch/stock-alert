@@ -6,7 +6,7 @@
 
 import logging
 import pandas as pd
-import pandas_ta as ta
+import ta as ta_lib
 from stock_alert.config import FUNDAMENTAL, TECHNICAL
 
 logger = logging.getLogger(__name__)
@@ -146,24 +146,22 @@ def calc_technical(history: pd.DataFrame) -> dict:
             result["golden_cross"] = cross_today and cross_prev
 
         # ── RSI ────────────────────────────────
-        rsi_series = ta.rsi(close, length=14)
+        rsi_series = ta_lib.momentum.RSIIndicator(close=close, window=14).rsi()
         if rsi_series is not None and not rsi_series.empty:
             rsi_val = float(rsi_series.iloc[-1])
             result["rsi_value"] = round(rsi_val, 1)
             result["rsi_ok"] = cfg["rsi_min"] <= rsi_val <= cfg["rsi_max"]
 
         # ── MACD クロス ─────────────────────────
-        macd_df = ta.macd(close, fast=12, slow=26, signal=9)
-        if macd_df is not None and not macd_df.empty:
-            macd_col = [c for c in macd_df.columns if "MACD_12_26_9" == c]
-            sig_col  = [c for c in macd_df.columns if "MACDs_12_26_9" == c]
-            if macd_col and sig_col and len(macd_df) >= 2:
-                macd_today = macd_df[macd_col[0]].iloc[-1]
-                sig_today  = macd_df[sig_col[0]].iloc[-1]
-                macd_prev  = macd_df[macd_col[0]].iloc[-2]
-                sig_prev   = macd_df[sig_col[0]].iloc[-2]
-                # MACDがシグナルを下から上抜け
-                result["macd_cross"] = (macd_today > sig_today) and (macd_prev <= sig_prev)
+        macd_obj = ta_lib.trend.MACD(close=close, window_slow=26, window_fast=12, window_sign=9)
+        macd_line   = macd_obj.macd()
+        signal_line = macd_obj.macd_signal()
+        if macd_line is not None and len(macd_line) >= 2:
+            macd_today = macd_line.iloc[-1]
+            sig_today  = signal_line.iloc[-1]
+            macd_prev  = macd_line.iloc[-2]
+            sig_prev   = signal_line.iloc[-2]
+            result["macd_cross"] = (macd_today > sig_today) and (macd_prev <= sig_prev)
 
     except Exception as e:
         logger.warning(f"テクニカル指標計算エラー: {e}")

@@ -53,9 +53,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/pending.json || true
           git diff --staged --quiet || git commit -m "chore: 朝の推奨銘柄を保存 $(date +'%Y-%m-%d')"
-          git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main
 
   # ─────────────────────────────────────
   # 夕方ジョブ: 終値取得 → results.csv追記 → Discord結果通知
@@ -90,6 +88,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/results.csv || true
           git diff --staged --quiet || git commit -m "data: 結果追跡データ更新 $(date +'%Y-%m-%d')"
-          git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main

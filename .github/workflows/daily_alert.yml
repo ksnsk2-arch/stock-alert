@@ -1,0 +1,95 @@
+name: Daily Stock Alert
+
+on:
+  schedule:
+    # ① 朝: UTC 23:00 = JST 翌日 08:00（平日のみ）
+    - cron: '0 23 * * 0-4'
+    # ② 夕: UTC 07:15 = JST 16:15（引け後、平日のみ）
+    - cron: '15 7 * * 1-5'
+  workflow_dispatch:  # 手動実行ボタン（テスト用）
+    inputs:
+      mode:
+        description: '実行モード'
+        required: false
+        default: 'morning'
+        type: choice
+        options:
+          - morning
+          - evening
+
+jobs:
+  # ─────────────────────────────────────
+  # 朝ジョブ: スクリーニング → Discord通知 → pending.json保存
+  # ─────────────────────────────────────
+  morning:
+    name: 朝のスクリーニング（08:00 JST）
+    runs-on: ubuntu-latest
+    # cron '0 23 * * 0-4' の時 OR 手動でmornignを選んだ時
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 23 * * 0-4') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'morning' || github.event.inputs.mode == ''))
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 依存関係をインストール
+        run: pip install -r requirements.txt
+
+      - name: スクリーニング実行 & Discord通知
+        run: python -m stock_alert.main
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          JQUANTS_REFRESH_TOKEN: ${{ secrets.JQUANTS_REFRESH_TOKEN }}
+
+      # pending.json をリポジトリにコミット（夕方ジョブで参照するため）
+      - name: pending.json をコミット
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/pending.json || true
+          git diff --staged --quiet || git commit -m "chore: 朝の推奨銘柄を保存 $(date +'%Y-%m-%d')"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─────────────────────────────────────
+  # 夕方ジョブ: 終値取得 → results.csv追記 → Discord結果通知
+  # ─────────────────────────────────────
+  evening:
+    name: 夕方の結果記録（16:15 JST）
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '15 7 * * 1-5') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'evening')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 依存関係をインストール
+        run: pip install -r requirements.txt
+
+      - name: 結果追跡 & Discord通知
+        run: python -m stock_alert.evening
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      # results.csv をリポジトリにコミット（データ蓄積）
+      - name: results.csv をコミット
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/results.csv || true
+          git diff --staged --quiet || git commit -m "data: 結果追跡データ更新 $(date +'%Y-%m-%d')"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

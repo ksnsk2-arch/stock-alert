@@ -1,0 +1,12 @@
+.env
+__pycache__/
+# data/ 配下はGitで追跡する（results.csv, pending.json を蓄積するため）
+# 除外しない
+*.pyc
+*.pyo
+.DS_Store
+*.egg-info/
+dist/
+build/
+.venv/
+venv/

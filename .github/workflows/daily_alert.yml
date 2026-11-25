@@ -2,11 +2,11 @@ name: Daily Stock Alert
 
 on:
   schedule:
-    # ① 朝: UTC 23:00 = JST 翌日 08:00（平日のみ）
+    # ① 朝: UTC 23:00 = JST 翌日 08:00（月〜金）
     - cron: '0 23 * * 0-4'
-    # ② 夕: UTC 07:15 = JST 16:15（引け後、平日のみ）
+    # ② 夕: UTC 07:15 = JST 16:15（引け後、月〜金）
     - cron: '15 7 * * 1-5'
-  workflow_dispatch:  # 手動実行ボタン（テスト用）
+  workflow_dispatch:
     inputs:
       mode:
         description: '実行モード'
@@ -17,18 +17,27 @@ on:
           - morning
           - evening
 
+# data/ へのコミットと、60日無活動による自動停止の解除に必要
+permissions:
+  contents: write
+  actions: write
+
+# 朝と夕が同時に走って data/ の push が衝突しないようにする
+concurrency:
+  group: stock-alert-data
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Tokyo
+  PYTHONUNBUFFERED: '1'
+
 jobs:
-  # ─────────────────────────────────────
-  # 朝ジョブ: スクリーニング → Discord通知 → pending.json保存
-  # ─────────────────────────────────────
   morning:
     name: 朝のスクリーニング（08:00 JST）
     runs-on: ubuntu-latest
-    # cron '0 23 * * 0-4' の時 OR 手動でmornignを選んだ時
     if: |
       (github.event_name == 'schedule' && github.event.schedule == '0 23 * * 0-4') ||
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'morning' || github.event.inputs.mode == ''))
-
     steps:
       - uses: actions/checkout@v4
 
@@ -44,27 +53,31 @@ jobs:
         run: python -m stock_alert.main
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          JQUANTS_MAIL_ADDRESS: ${{ secrets.JQUANTS_MAIL_ADDRESS }}
+          JQUANTS_PASSWORD: ${{ secrets.JQUANTS_PASSWORD }}
           JQUANTS_REFRESH_TOKEN: ${{ secrets.JQUANTS_REFRESH_TOKEN }}
 
-      # pending.json をリポジトリにコミット（夕方ジョブで参照するため）
-      - name: pending.json をコミット
+      - name: 追跡データをコミット
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/pending.json || true
-          git diff --staged --quiet || git commit -m "chore: 朝の推奨銘柄を保存 $(date +'%Y-%m-%d')"
-          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main
+          git add -A data/
+          git diff --staged --quiet || git commit -m "data: 朝便 $(date +'%Y-%m-%d')"
+          git pull --rebase origin main
+          git push origin HEAD:main
 
-  # ─────────────────────────────────────
-  # 夕方ジョブ: 終値取得 → results.csv追記 → Discord結果通知
-  # ─────────────────────────────────────
+      # Bot のコミットは「活動」に数えられず60日で止まるので、毎回明示的に有効化し直す
+      - name: スケジュール自動停止を防ぐ
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/daily_alert.yml/enable"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   evening:
-    name: 夕方の結果記録（16:15 JST）
+    name: 夕方の追跡レポート（16:15 JST）
     runs-on: ubuntu-latest
     if: |
       (github.event_name == 'schedule' && github.event.schedule == '15 7 * * 1-5') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'evening')
-
     steps:
       - uses: actions/checkout@v4
 
@@ -76,16 +89,16 @@ jobs:
       - name: 依存関係をインストール
         run: pip install -r requirements.txt
 
-      - name: 結果追跡 & Discord通知
+      - name: 追跡更新 & Discord通知
         run: python -m stock_alert.evening
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
-      # results.csv をリポジトリにコミット（データ蓄積）
-      - name: results.csv をコミット
+      - name: 追跡データをコミット
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/results.csv || true
-          git diff --staged --quiet || git commit -m "data: 結果追跡データ更新 $(date +'%Y-%m-%d')"
-          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main
+          git add -A data/
+          git diff --staged --quiet || git commit -m "data: 夕便 $(date +'%Y-%m-%d')"
+          git pull --rebase origin main
+          git push origin HEAD:main

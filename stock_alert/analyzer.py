@@ -1,7 +1,7 @@
 """
 指標計算モジュール
-- ファンダメンタル指標のスコアリング
-- テクニカル指標（MA, RSI, MACD, 出来高）の計算
+- ファンダメンタル指標のスコアリング（6項目）
+- テクニカル指標（MA, RSI, MACD, 出来高）の計算と4シグナル判定
 """
 
 import logging
@@ -16,71 +16,55 @@ logger = logging.getLogger(__name__)
 # ファンダメンタル分析
 # ─────────────────────────────────────────────
 
+def _judge(value, ok: bool, label: str) -> dict:
+    return {"value": value, "ok": ok, "label": label}
+
+
 def score_fundamental(data: dict) -> tuple[int, dict]:
     """
-    ファンダメンタル指標をスコアリングする。
-
-    Returns:
-        (score, detail): スコア（最大6点）と各指標の評価詳細
+    ファンダメンタル6項目を判定し、(score, detail) を返す。score は最大6点。
+    データ欠損は不合格扱い（0点）だが label で「データなし」と分かるようにする。
     """
     cfg = FUNDAMENTAL
-    score = 0
     detail = {}
 
-    # PER: 5〜20倍
     per = data.get("per")
-    if per is not None:
-        ok = cfg["per_min"] <= per <= cfg["per_max"]
-        score += 1 if ok else 0
-        detail["per"] = {"value": per, "ok": ok, "label": f"{per:.1f}倍"}
-    else:
-        detail["per"] = {"value": None, "ok": False, "label": "データなし"}
+    detail["per"] = (
+        _judge(per, cfg["per_min"] <= per <= cfg["per_max"], f"{per:.1f}倍")
+        if per is not None else _judge(None, False, "データなし")
+    )
 
-    # PBR: 1.5倍以下
     pbr = data.get("pbr")
-    if pbr is not None:
-        ok = pbr <= cfg["pbr_max"]
-        score += 1 if ok else 0
-        detail["pbr"] = {"value": pbr, "ok": ok, "label": f"{pbr:.2f}倍"}
-    else:
-        detail["pbr"] = {"value": None, "ok": False, "label": "データなし"}
+    detail["pbr"] = (
+        _judge(pbr, pbr <= cfg["pbr_max"], f"{pbr:.2f}倍")
+        if pbr is not None else _judge(None, False, "データなし")
+    )
 
-    # ROE: 8%以上
     roe = data.get("roe")
-    if roe is not None:
-        ok = roe >= cfg["roe_min"]
-        score += 1 if ok else 0
-        detail["roe"] = {"value": roe, "ok": ok, "label": f"{roe:.1f}%"}
-    else:
-        detail["roe"] = {"value": None, "ok": False, "label": "データなし"}
+    detail["roe"] = (
+        _judge(roe, roe >= cfg["roe_min"], f"{roe:.1f}%")
+        if roe is not None else _judge(None, False, "データなし")
+    )
 
-    # 配当利回り: 1.5%以上
     dy = data.get("dividend_yield")
-    if dy is not None:
-        ok = dy >= cfg["dividend_yield_min"]
-        score += 1 if ok else 0
-        detail["dividend_yield"] = {"value": dy, "ok": ok, "label": f"{dy:.1f}%"}
-    else:
-        detail["dividend_yield"] = {"value": None, "ok": False, "label": "データなし"}
+    detail["dividend_yield"] = (
+        _judge(dy, dy >= cfg["dividend_yield_min"], f"{dy:.2f}%")
+        if dy is not None else _judge(None, False, "データなし")
+    )
 
-    # 売上高成長率: 0%以上（マイナス成長を除外）
     rg = data.get("revenue_growth")
-    if rg is not None:
-        ok = rg >= cfg["revenue_growth_min"]
-        score += 1 if ok else 0
-        detail["revenue_growth"] = {"value": rg, "ok": ok, "label": f"{rg:+.1f}%"}
-    else:
-        detail["revenue_growth"] = {"value": None, "ok": False, "label": "データなし"}
+    detail["revenue_growth"] = (
+        _judge(rg, rg >= cfg["revenue_growth_min"], f"{rg:+.1f}%")
+        if rg is not None else _judge(None, False, "データなし")
+    )
 
-    # 自己資本比率: 30%以上
     er = data.get("equity_ratio")
-    if er is not None:
-        ok = er >= cfg["equity_ratio_min"]
-        score += 1 if ok else 0
-        detail["equity_ratio"] = {"value": er, "ok": ok, "label": f"{er:.1f}%"}
-    else:
-        detail["equity_ratio"] = {"value": None, "ok": False, "label": "データなし"}
+    detail["equity_ratio"] = (
+        _judge(er, er >= cfg["equity_ratio_min"], f"{er:.1f}%")
+        if er is not None else _judge(None, False, "データなし")
+    )
 
+    score = sum(1 for d in detail.values() if d["ok"])
     return score, detail
 
 
@@ -88,35 +72,50 @@ def score_fundamental(data: dict) -> tuple[int, dict]:
 # テクニカル分析
 # ─────────────────────────────────────────────
 
+TECH_SIGNALS = ("trend_up", "macd_bull", "rsi_ok", "volume_surge")
+
+
+def _crossed_up_within(fast: pd.Series, slow: pd.Series, days: int) -> bool:
+    """直近 days 本以内に fast が slow を下から上に抜けたか。"""
+    diff = (fast - slow).dropna()
+    if len(diff) < days + 1:
+        return False
+    recent = diff.iloc[-(days + 1):]
+    for i in range(1, len(recent)):
+        if recent.iloc[i - 1] <= 0 < recent.iloc[i]:
+            return True
+    return False
+
+
 def calc_technical(history: pd.DataFrame) -> dict:
     """
-    テクニカル指標を計算する。
+    テクニカル指標を計算し、4シグナルの真偽と各値を返す。
 
-    Returns:
-        {
-            "volume_surge": bool,     # 出来高急増
-            "golden_cross": bool,     # ゴールデンクロス
-            "rsi_ok": bool,           # RSI適正ゾーン
-            "macd_cross": bool,       # MACDクロス
-            "volume_ratio": float,    # 出来高倍率
-            "rsi_value": float,       # RSI値
-            "ma_short": float,        # 短期MA値
-            "ma_long": float,         # 長期MA値
-        }
+    シグナル:
+      trend_up     : 終値 > MA25 かつ MA5 > MA25（上昇トレンドの状態）
+      macd_bull    : MACD > シグナル線
+      rsi_ok       : RSI(14) が適正ゾーン（買われすぎ・売られすぎでない）
+      volume_surge : 出来高が20日平均の一定倍以上
+    補助:
+      fresh        : 直近N日以内にGCまたはMACDクロスが発生（ランク加点用）
     """
     cfg = TECHNICAL
     result = {
-        "volume_surge": False,
-        "golden_cross": False,
+        "trend_up": False,
+        "macd_bull": False,
         "rsi_ok": False,
-        "macd_cross": False,
+        "volume_surge": False,
+        "fresh": False,
+        "golden_cross_recent": False,
+        "macd_cross_recent": False,
         "volume_ratio": 0.0,
         "rsi_value": 0.0,
         "ma_short": 0.0,
         "ma_long": 0.0,
+        "close": 0.0,
     }
 
-    if history is None or len(history) < cfg["ma_long"] + 5:
+    if history is None or len(history) < cfg["ma_long"] + 10:
         logger.warning("テクニカル計算: データ不足")
         return result
 
@@ -124,44 +123,38 @@ def calc_technical(history: pd.DataFrame) -> dict:
     volume = history["Volume"]
 
     try:
-        # ── 出来高急増 ──────────────────────────
+        result["close"] = round(float(close.iloc[-1]), 1)
+
+        # ── 出来高 ───────────────────────────────
         vol_ma20 = volume.rolling(20).mean().iloc[-1]
-        vol_today = volume.iloc[-1]
-        if vol_ma20 > 0:
-            ratio = vol_today / vol_ma20
+        if vol_ma20 and vol_ma20 > 0:
+            ratio = float(volume.iloc[-1]) / float(vol_ma20)
             result["volume_ratio"] = round(ratio, 2)
             result["volume_surge"] = ratio >= cfg["volume_surge_ratio"]
 
-        # ── 移動平均・ゴールデンクロス ───────────
-        ma_short = close.rolling(cfg["ma_short"]).mean()
-        ma_long = close.rolling(cfg["ma_long"]).mean()
-
-        result["ma_short"] = round(float(ma_short.iloc[-1]), 1)
-        result["ma_long"] = round(float(ma_long.iloc[-1]), 1)
-
-        # 当日: MA5 > MA25、前日: MA5 <= MA25 → ゴールデンクロス
-        if len(ma_short) >= 2 and len(ma_long) >= 2:
-            cross_today = ma_short.iloc[-1] > ma_long.iloc[-1]
-            cross_prev = ma_short.iloc[-2] <= ma_long.iloc[-2]
-            result["golden_cross"] = cross_today and cross_prev
+        # ── 移動平均・トレンド ────────────────────
+        ma_s = close.rolling(cfg["ma_short"]).mean()
+        ma_l = close.rolling(cfg["ma_long"]).mean()
+        result["ma_short"] = round(float(ma_s.iloc[-1]), 1)
+        result["ma_long"] = round(float(ma_l.iloc[-1]), 1)
+        result["trend_up"] = bool(close.iloc[-1] > ma_l.iloc[-1] and ma_s.iloc[-1] > ma_l.iloc[-1])
+        result["golden_cross_recent"] = _crossed_up_within(ma_s, ma_l, cfg["fresh_cross_days"])
 
         # ── RSI ────────────────────────────────
-        rsi_series = ta_lib.momentum.RSIIndicator(close=close, window=14).rsi()
-        if rsi_series is not None and not rsi_series.empty:
-            rsi_val = float(rsi_series.iloc[-1])
-            result["rsi_value"] = round(rsi_val, 1)
-            result["rsi_ok"] = cfg["rsi_min"] <= rsi_val <= cfg["rsi_max"]
+        rsi = ta_lib.momentum.RSIIndicator(close=close, window=14).rsi()
+        if rsi is not None and not rsi.dropna().empty:
+            v = float(rsi.dropna().iloc[-1])
+            result["rsi_value"] = round(v, 1)
+            result["rsi_ok"] = cfg["rsi_min"] <= v <= cfg["rsi_max"]
 
-        # ── MACD クロス ─────────────────────────
-        macd_obj = ta_lib.trend.MACD(close=close, window_slow=26, window_fast=12, window_sign=9)
-        macd_line   = macd_obj.macd()
-        signal_line = macd_obj.macd_signal()
-        if macd_line is not None and len(macd_line) >= 2:
-            macd_today = macd_line.iloc[-1]
-            sig_today  = signal_line.iloc[-1]
-            macd_prev  = macd_line.iloc[-2]
-            sig_prev   = signal_line.iloc[-2]
-            result["macd_cross"] = (macd_today > sig_today) and (macd_prev <= sig_prev)
+        # ── MACD ───────────────────────────────
+        macd = ta_lib.trend.MACD(close=close, window_slow=26, window_fast=12, window_sign=9)
+        macd_line, sig_line = macd.macd(), macd.macd_signal()
+        if macd_line is not None and not macd_line.dropna().empty:
+            result["macd_bull"] = bool(macd_line.iloc[-1] > sig_line.iloc[-1])
+            result["macd_cross_recent"] = _crossed_up_within(macd_line, sig_line, cfg["fresh_cross_days"])
+
+        result["fresh"] = result["golden_cross_recent"] or result["macd_cross_recent"]
 
     except Exception as e:
         logger.warning(f"テクニカル指標計算エラー: {e}")
@@ -170,10 +163,5 @@ def calc_technical(history: pd.DataFrame) -> dict:
 
 
 def count_tech_signals(tech: dict) -> int:
-    """テクニカル条件を何個クリアしているかを返す。"""
-    return sum([
-        tech["volume_surge"],
-        tech["golden_cross"],
-        tech["rsi_ok"],
-        tech["macd_cross"],
-    ])
+    """4シグナルのうち何個クリアしているかを返す。"""
+    return sum(1 for k in TECH_SIGNALS if tech.get(k))

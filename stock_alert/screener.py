@@ -1,108 +1,135 @@
 """
 2段階スクリーニングモジュール
-1st pass: ファンダメンタルスコアで上位15銘柄に絞る
-2nd pass: テクニカル条件で「今が仕込みどき」を確認
+1st pass: ファンダメンタルスコア（6項目）で足切り＆上位N銘柄に絞る
+2nd pass: テクニカル4シグナルで「今が仕込みどき」を確認
 """
 
 import logging
-from stock_alert.config import FUNDAMENTAL, TECHNICAL, TOP_N, BUDGET, LOT_SIZE, MAX_STOCK_PRICE, TAKE_PROFIT_PCT, STOP_LOSS_PCT
+import math
+
+from stock_alert.config import (
+    FUNDAMENTAL, TECHNICAL, TOP_N,
+    BUDGET, MAX_POSITION_RATIO, TRADE_MODE, LOT_SIZE, MAX_STOCK_PRICE,
+    TAKE_PROFIT_PCT, STOP_LOSS_PCT,
+)
 from stock_alert.analyzer import score_fundamental, calc_technical, count_tech_signals
 
 logger = logging.getLogger(__name__)
 
 
-def run_screening(all_data: list[dict]) -> list[dict]:
+def position_size(price: float) -> tuple[int, float]:
+    """予算内で買える株数と投入額を返す。買えなければ (0, 0)。"""
+    cap = BUDGET * MAX_POSITION_RATIO
+    if price is None or price <= 0:
+        return 0, 0.0
+    if TRADE_MODE == "lot":
+        if price > MAX_STOCK_PRICE:
+            return 0, 0.0
+        lots = math.floor(cap / (price * LOT_SIZE))
+        shares = lots * LOT_SIZE
+    else:
+        shares = math.floor(cap / price)
+    return shares, shares * price
+
+
+def run_screening(all_data: list[dict], exclude: set[str] | None = None) -> tuple[list[dict], dict, list[dict]]:
     """
-    全銘柄データを2段階でスクリーニングし、推奨銘柄リストを返す。
+    全銘柄データを2段階でスクリーニングする。
+
+    Args:
+        all_data: fetch_all の結果
+        exclude:  既に追跡中などで除外するティッカー集合
 
     Returns:
-        推奨銘柄のリスト（辞書形式、通知に必要な情報を含む）
+        (推奨銘柄リスト, ファネル統計, 惜しい銘柄リスト)
     """
-    # ── 1st pass: ファンダメンタルスクリーニング ──────────────
-    logger.info("=== 1st pass: ファンダメンタルスクリーニング ===")
+    exclude = exclude or set()
+    stats = {
+        "total": len(all_data),
+        "priced": 0,
+        "affordable": 0,
+        "f_pass": 0,
+        "candidates": 0,
+        "tech_pass": 0,
+    }
 
-    fundamental_scored = []
-
-    for data in all_data:
-        ticker = data["ticker"]
-        price = data.get("price")
-
-        # 株価が取得できない銘柄はスキップ
+    # ── 1st pass: ファンダメンタル ─────────────────────────
+    logger.info("=== 1st pass: ファンダメンタル ===")
+    scored = []
+    for d in all_data:
+        price = d.get("price")
         if price is None:
             continue
+        stats["priced"] += 1
 
-        # 予算内で1単元買えるかチェック
-        lot_cost = price * LOT_SIZE
-        if price > MAX_STOCK_PRICE:
-            logger.debug(f"{ticker}: 株価¥{price:,.0f} > 上限¥{MAX_STOCK_PRICE} → スキップ（ミニ株使用なら config.MAX_STOCK_PRICE を変更）")
+        shares, cost = position_size(price)
+        if shares <= 0:
+            logger.debug(f"{d['ticker']}: 株価¥{price:,.0f} は予算内で買えない → スキップ")
             continue
+        stats["affordable"] += 1
 
-        # ファンダメンタルスコア計算
-        f_score, f_detail = score_fundamental(data)
+        f_score, f_detail = score_fundamental(d)
+        if f_score < FUNDAMENTAL["min_f_score"]:
+            continue
+        stats["f_pass"] += 1
 
-        fundamental_scored.append({
-            "ticker": ticker,
-            "name": data.get("name", ticker),
+        scored.append({
+            "ticker": d["ticker"],
+            "name": d.get("name", d["ticker"]),
             "price": price,
-            "lot_cost": lot_cost,
-            "sector": data.get("sector", "不明"),
+            "shares": shares,
+            "cost": cost,
+            "sector": d.get("sector", "不明"),
+            "dividend_yield": d.get("dividend_yield"),
             "f_score": f_score,
             "f_detail": f_detail,
-            "history": data.get("history"),
+            "history": d.get("history"),
         })
 
-        logger.debug(f"{ticker}: ファンダスコア {f_score}/6")
+    scored.sort(key=lambda x: (x["f_score"], x["dividend_yield"] or 0), reverse=True)
+    candidates = scored[: FUNDAMENTAL["top_n_fundamental"]]
+    stats["candidates"] = len(candidates)
+    logger.info(
+        f"1st pass: 株価あり{stats['priced']} → 予算内{stats['affordable']} → "
+        f"スコア{FUNDAMENTAL['min_f_score']}以上{stats['f_pass']} → 上位{len(candidates)}銘柄"
+    )
 
-    # スコア降順でソートし、上位N件を取り出す
-    top_n = FUNDAMENTAL["top_n_fundamental"]
-    fundamental_scored.sort(key=lambda x: x["f_score"], reverse=True)
-    candidates = fundamental_scored[:top_n]
-
-    logger.info(f"1st pass 通過: {len(candidates)}/{len(all_data)} 銘柄（上位{top_n}件）")
-
-    # ── 2nd pass: テクニカルスクリーニング ──────────────────
-    logger.info("=== 2nd pass: テクニカルスクリーニング ===")
-
-    results = []
+    # ── 2nd pass: テクニカル ───────────────────────────────
+    logger.info("=== 2nd pass: テクニカル ===")
+    passed, near = [], []
+    required = TECHNICAL["tech_signals_required"]
 
     for c in candidates:
-        history = c.get("history")
-        if history is None:
+        if c["history"] is None:
             continue
-
-        tech = calc_technical(history)
-        tech_count = count_tech_signals(tech)
-        required = TECHNICAL["tech_signals_required"]
-
+        tech = calc_technical(c["history"])
+        tc = count_tech_signals(tech)
+        price = c["price"]
+        row = {
+            **{k: v for k, v in c.items() if k != "history"},
+            "tech": tech,
+            "tech_count": tc,
+            "take_profit": round(price * (1 + TAKE_PROFIT_PCT / 100), 1),
+            "stop_loss": round(price * (1 - STOP_LOSS_PCT / 100), 1),
+        }
         logger.debug(
-            f"{c['ticker']}: テクニカル {tech_count}/{4}条件クリア "
-            f"（出来高{tech['volume_ratio']:.1f}x, RSI{tech['rsi_value']:.0f}, "
-            f"GC={tech['golden_cross']}, MACD={tech['macd_cross']}）"
+            f"{c['ticker']}: ファンダ{c['f_score']}/6 テクニカル{tc}/4 "
+            f"(trend={tech['trend_up']} macd={tech['macd_bull']} rsi={tech['rsi_value']} vol={tech['volume_ratio']}x fresh={tech['fresh']})"
         )
+        if c["ticker"] in exclude:
+            continue
+        if tc >= required:
+            passed.append(row)
+        else:
+            near.append(row)
 
-        if tech_count >= required:
-            price = c["price"]
-            take_profit = round(price * (1 + TAKE_PROFIT_PCT / 100), 0)
-            stop_loss   = round(price * (1 - STOP_LOSS_PCT / 100), 0)
+    stats["tech_pass"] = len(passed)
 
-            results.append({
-                "ticker":       c["ticker"],
-                "name":         c["name"],
-                "price":        price,
-                "lot_cost":     c["lot_cost"],
-                "sector":       c["sector"],
-                "f_score":      c["f_score"],
-                "f_detail":     c["f_detail"],
-                "tech":         tech,
-                "tech_count":   tech_count,
-                "take_profit":  take_profit,
-                "stop_loss":    stop_loss,
-            })
+    # ランク: テクニカル数 → 新鮮なクロスあり → ファンダ → 配当
+    rank_key = lambda x: (x["tech_count"], x["tech"]["fresh"], x["f_score"], x["dividend_yield"] or 0)
+    passed.sort(key=rank_key, reverse=True)
+    near.sort(key=rank_key, reverse=True)
 
-    # テクニカルシグナル数 → ファンダスコアの順でソート
-    results.sort(key=lambda x: (x["tech_count"], x["f_score"]), reverse=True)
-
-    top_results = results[:TOP_N]
-    logger.info(f"2nd pass 通過: {len(top_results)} 銘柄（最終推奨）")
-
-    return top_results
+    top = passed[:TOP_N]
+    logger.info(f"2nd pass: {len(passed)} 銘柄通過 → 推奨 {len(top)} 銘柄")
+    return top, stats, near[:3]
